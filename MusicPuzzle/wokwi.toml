@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "esp32_servo_control/build/esp32_servo_control.ino.bin"
+elf = "esp32_servo_control/build/esp32_servo_control.ino.elf"

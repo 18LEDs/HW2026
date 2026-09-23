@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "morse_puzzle/build/morse_puzzle.ino.bin"
+elf = "morse_puzzle/build/morse_puzzle.ino.elf"

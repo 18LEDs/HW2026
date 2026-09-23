@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "rfid_puzzle/build/rfid_puzzle.ino.bin"
+elf = "rfid_puzzle/build/rfid_puzzle.ino.elf"

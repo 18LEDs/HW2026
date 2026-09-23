@@ -1,0 +1,4 @@
+[wokwi]
+version = 1
+firmware = "phone_puzzle/build/phone_puzzle.ino.bin"
+elf = "phone_puzzle/build/phone_puzzle.ino.elf"
