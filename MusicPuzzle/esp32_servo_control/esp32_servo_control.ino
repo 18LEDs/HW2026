@@ -35,6 +35,21 @@
   or tablet - BLE MIDI peripherals accept one central at a time, so
   close Piano Partner / disconnect the iPad before testing this.
 
+  ----------------------------------------------------------------------
+  SERIAL MONITOR TEST COMMANDS
+  ----------------------------------------------------------------------
+  Set the Serial Monitor to 115200 baud and "Newline" line ending, then
+  type a command and press Enter. These work with or without the piano
+  connected, so the servo and sequence logic can be tested on the bench.
+    o      open the box now
+    c      close the box now
+    n60    pretend note 60 was played (any 0-127)
+    s      show status
+    l      toggle listen-only mode
+    h      show this list
+  While the piano isn't connected, each BLE scan blocks for a few
+  seconds, so commands may take a moment to respond.
+
   Wiring:
     Servo signal wire -> GPIO 18 (or change SERVO_PIN below)
     Servo power (red)  -> 5V (see note below)
@@ -68,13 +83,14 @@ const char *PIANO_MAC_MATCH = "e1:63:47:6f:61:0f";
 
 // Set true to print every note you play and never check the sequence
 // or move the servo. Use this to work out the MIDI note numbers for
-// your chosen tune, then set it back to false.
+// your chosen tune, then set it back to false. This is the starting
+// value; the "l" serial command toggles it at runtime.
 const bool LISTEN_ONLY_MODE = false;
 
 // The secret sequence as MIDI note numbers. Middle C = 60, and each
 // key going up (white or black) is +1.
 const int SEQUENCE_LENGTH = 4;
-const uint8_t TARGET_SEQUENCE[SEQUENCE_LENGTH] = {60, 57, 67, 64};  // C E G C
+const uint8_t TARGET_SEQUENCE[SEQUENCE_LENGTH] = {60, 57, 67, 64};  // C A G E
 
 // If notes come in with too long a pause between them the buffer
 // resets, so nobody can noodle through every key and stumble into it.
@@ -86,10 +102,15 @@ const int SERVO_PIN = 18;
 const int CLOSED_ANGLE = 0;
 const int OPEN_ANGLE = 90;
 
-// Delay in milliseconds between each 1-degree step. Higher = slower,
-// more dramatic reveal. Tune this once it's actually mounted in the
-// box - 60ms/degree over a 90 degree sweep is about 5.5 seconds.
-const int STEP_DELAY_MS = 60;
+// Pulse widths for 0 and 180 degrees. Positions are sent in
+// microseconds rather than whole degrees, so the sweep has much finer
+// steps than 1 degree.
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2400;
+
+// How long the opening sweep takes, start to finish. Higher = slower,
+// more dramatic reveal. Tune this once it's actually mounted in the box.
+const unsigned long OPEN_SWEEP_MS = 5500;
 
 // How long the box stays open before it closes itself again. Timer
 // starts once the box has finished opening, not from the trigger.
@@ -97,7 +118,11 @@ const unsigned long OPEN_DURATION_MS = 15000;
 
 // Closing can be faster than opening - the "reveal" is the slow part,
 // the box quietly resetting itself doesn't need the same drama.
-const int CLOSE_STEP_DELAY_MS = 15;
+const unsigned long CLOSE_SWEEP_MS = 1500;
+
+// A new position is sent every servo frame (50Hz = 20ms). Updating
+// less often than this is what makes a slow sweep look steppy.
+const unsigned long SERVO_FRAME_MS = 20;
 
 // How long to wait between scan attempts when not connected.
 const unsigned long RESCAN_DELAY_MS = 2000;
@@ -117,6 +142,8 @@ unsigned long lastNoteMs = 0;
 
 unsigned long lastScanMs = 0;
 bool wasConnected = false;
+
+bool listenOnly = LISTEN_ONLY_MODE;
 
 // Notes arrive on the BLE stack's own task, NOT on the loop() task.
 // Doing anything slow in that callback - and the servo sweep takes
@@ -157,13 +184,13 @@ void setup() {
   // Allows the servo to use standard 50Hz timing on the ESP32
   ESP32PWM::allocateTimer(0);
   boxServo.setPeriodHertz(50);
-  boxServo.attach(SERVO_PIN, 500, 2400);
+  boxServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
   boxServo.write(CLOSED_ANGLE);
   delay(500);
 
   Serial.println();
   Serial.println("=== MIDI Box Puzzle (BLE) ===");
-  if (LISTEN_ONLY_MODE) {
+  if (listenOnly) {
     Serial.println("LISTEN ONLY mode - notes are printed, servo will not move.");
   } else {
     Serial.print("Target sequence: ");
@@ -181,9 +208,22 @@ void setup() {
 
   Serial.println("Make sure the piano's Bluetooth MIDI is ON and that no");
   Serial.println("phone or tablet is already connected to it.");
+  Serial.println();
+  printHelp();
 }
 
 void loop() {
+  handleSerial();
+
+  // Non-blocking check: has the box been open long enough to close
+  // itself? Using millis() here instead of delay() means the ESP32
+  // is still free to service Bluetooth while it waits. Checked before
+  // the connection test so a box opened from the bench still closes.
+  if (waitingToClose && (millis() - openedAtMillis >= OPEN_DURATION_MS)) {
+    Serial.println("Auto-close timer elapsed - closing box.");
+    closeBox();
+  }
+
   if (!BLEMidiClient.isConnected()) {
     if (wasConnected) {
       wasConnected = false;
@@ -207,16 +247,6 @@ void loop() {
   // Reset a stalled attempt after too long a gap between notes.
   if (bufferLength > 0 && (millis() - lastNoteMs > MAX_GAP_MS)) {
     resetAttempt("too slow");
-  }
-
-  // Non-blocking check: has the box been open long enough to close
-  // itself? Using millis() here instead of delay() means the ESP32
-  // is still free to service Bluetooth while it waits.
-  if (waitingToClose && (millis() - openedAtMillis >= OPEN_DURATION_MS)) {
-    Serial.println("Auto-close timer elapsed - closing box.");
-    closeBoxSlowly();
-    isOpen = false;
-    waitingToClose = false;
   }
 }
 
@@ -273,7 +303,7 @@ void scanAndConnect() {
 }
 
 void handleNote(uint8_t note) {
-  if (LISTEN_ONLY_MODE) {
+  if (listenOnly) {
     Serial.print("Note played: ");
     Serial.println(note);
     return;
@@ -322,11 +352,8 @@ void handleNote(uint8_t note) {
   Serial.println("*** CORRECT SEQUENCE - OPENING BOX ***");
   bufferLength = 0;
 
-  if (!isOpen && !waitingToClose) {
-    openBoxSlowly();
-    isOpen = true;
-    waitingToClose = true;
-    openedAtMillis = millis();
+  if (!isOpen) {
+    openBox();
   }
 }
 
@@ -339,18 +366,155 @@ void resetAttempt(const char *reason) {
   bufferLength = 0;
 }
 
+// Opens the box and starts the auto-close timer.
+void openBox() {
+  openBoxSlowly();
+  isOpen = true;
+  waitingToClose = true;
+  openedAtMillis = millis();
+}
+
+void closeBox() {
+  closeBoxSlowly();
+  isOpen = false;
+  waitingToClose = false;
+}
+
 void openBoxSlowly() {
-  for (int angle = CLOSED_ANGLE; angle <= OPEN_ANGLE; angle++) {
-    boxServo.write(angle);
-    delay(STEP_DELAY_MS);
-  }
+  sweepServo(CLOSED_ANGLE, OPEN_ANGLE, OPEN_SWEEP_MS);
   Serial.println("Box open.");
 }
 
 void closeBoxSlowly() {
-  for (int angle = OPEN_ANGLE; angle >= CLOSED_ANGLE; angle--) {
-    boxServo.write(angle);
-    delay(CLOSE_STEP_DELAY_MS);
-  }
+  sweepServo(OPEN_ANGLE, CLOSED_ANGLE, CLOSE_SWEEP_MS);
   Serial.println("Box closed. Ready for next trigger.");
+}
+
+int angleToUs(int angle) {
+  return SERVO_MIN_US + (long)(SERVO_MAX_US - SERVO_MIN_US) * angle / 180;
+}
+
+// Moves the servo from one angle to another over durationMs, updating
+// every servo frame. Position follows an ease-in-out curve so the lid
+// starts and stops gently instead of lurching, and is timed off
+// millis() so the total duration stays accurate.
+void sweepServo(int fromAngle, int toAngle, unsigned long durationMs) {
+  int fromUs = angleToUs(fromAngle);
+  int toUs = angleToUs(toAngle);
+  unsigned long start = millis();
+  unsigned long elapsed;
+
+  while ((elapsed = millis() - start) < durationMs) {
+    float t = (float)elapsed / durationMs;
+    float eased = 0.5f - 0.5f * cosf(PI * t);
+    boxServo.writeMicroseconds(fromUs + lroundf((toUs - fromUs) * eased));
+    delay(SERVO_FRAME_MS);
+  }
+  boxServo.writeMicroseconds(toUs);
+}
+
+// ============================================================
+// Serial Monitor test commands
+// ============================================================
+
+// Collects typed characters into a line without blocking, then runs
+// it as a command when Enter (newline) arrives.
+void handleSerial() {
+  static String line;
+  while (Serial.available()) {
+    char ch = Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      line.trim();
+      if (line.length() > 0) {
+        runCommand(line);
+      }
+      line = "";
+    } else {
+      line += ch;
+    }
+  }
+}
+
+void runCommand(const String &cmd) {
+  char c = tolower(cmd.charAt(0));
+
+  if (c == 'o') {
+    if (isOpen) {
+      Serial.println("[CMD] Box is already open.");
+      return;
+    }
+    Serial.println("[CMD] Opening box.");
+    openBox();
+  } else if (c == 'c') {
+    if (!isOpen) {
+      Serial.println("[CMD] Box is already closed.");
+      return;
+    }
+    Serial.println("[CMD] Closing box.");
+    closeBox();
+  } else if (c == 'n') {
+    String arg = cmd.substring(1);
+    arg.trim();
+    bool digitsOnly = arg.length() > 0;
+    for (unsigned int i = 0; i < arg.length(); i++) {
+      if (!isDigit(arg.charAt(i))) {
+        digitsOnly = false;
+      }
+    }
+    int note = arg.toInt();
+    if (!digitsOnly || note > 127) {
+      Serial.println("[CMD] Usage: n<note>, e.g. n60 (0-127).");
+      return;
+    }
+    Serial.printf("[CMD] Simulating note %d.\n", note);
+    handleNote((uint8_t)note);
+  } else if (c == 's') {
+    printStatus();
+  } else if (c == 'l') {
+    listenOnly = !listenOnly;
+    resetAttempt("mode changed");
+    Serial.println(listenOnly ? "[CMD] Listen-only mode ON - servo will not move."
+                              : "[CMD] Listen-only mode OFF - puzzle active.");
+  } else if (c == 'h' || c == '?') {
+    printHelp();
+  } else {
+    Serial.print("[CMD] Unknown command: ");
+    Serial.println(cmd);
+    printHelp();
+  }
+}
+
+void printStatus() {
+  Serial.println("--- Status ---");
+  Serial.printf("  Piano:  %s\n", BLEMidiClient.isConnected() ? "connected" : "not connected");
+  Serial.printf("  Box:    %s", isOpen ? "open" : "closed");
+  if (waitingToClose) {
+    unsigned long elapsed = millis() - openedAtMillis;
+    unsigned long remaining = elapsed < OPEN_DURATION_MS ? OPEN_DURATION_MS - elapsed : 0;
+    Serial.printf(" (auto-close in %lu s)", remaining / 1000);
+  }
+  Serial.println();
+  Serial.printf("  Mode:   %s\n", listenOnly ? "listen only" : "puzzle");
+  Serial.print("  Target: ");
+  for (int i = 0; i < SEQUENCE_LENGTH; i++) {
+    Serial.print(TARGET_SEQUENCE[i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+  Serial.print("  Buffer: ");
+  for (int i = 0; i < bufferLength; i++) {
+    Serial.print(buffer[i]);
+    Serial.print(' ');
+  }
+  Serial.println(bufferLength == 0 ? "(empty)" : "");
+}
+
+void printHelp() {
+  Serial.println("Serial commands (Newline line ending):");
+  Serial.println("  o      open the box now");
+  Serial.println("  c      close the box now");
+  Serial.println("  n60    pretend note 60 was played");
+  Serial.println("  s      show status");
+  Serial.println("  l      toggle listen-only mode");
+  Serial.println("  h      show this list");
 }

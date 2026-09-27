@@ -2,10 +2,10 @@
   Children of the Pier - Phone / DTMF Puzzle - ESP32 Firmware
   ----------------------------------------------------------------------
   Reads digits dialed on the gutted push-button phone via the MT8870
-  DTMF decoder module. When the correct number has been dialed, plays
-  a "correct" audio clip through the DFPlayer Mini -> PAM8403 amp ->
-  phone's earpiece speaker. Wrong numbers get a randomly chosen
-  "wrong number" clip instead.
+  DTMF decoder module. Each of the known numbers (see PHONE_BOOK) has
+  its own audio clip, played through the DFPlayer Mini -> PAM8403 amp ->
+  phone's earpiece speaker. Any other number gets the "wrong number"
+  clip instead.
 
   Library needed: "DFRobotDFPlayerMini" by DFRobot (search that exact
   name in Arduino IDE > Manage Libraries).
@@ -23,10 +23,13 @@
   MicroSD card setup:
     Format as FAT32. Create a folder named exactly "mp3" in the ROOT
     of the card, and put the clips inside it with 4-digit names:
-      /mp3/0001.mp3   <- the "correct number" message
-      /mp3/0002.mp3   <- wrong-number variant 1
-      /mp3/0003.mp3   <- wrong-number variant 2
-      /mp3/0004.mp3   <- wrong-number variant 3
+      /mp3/0001.mp3   <- recording for phone book number 1
+      /mp3/0002.mp3   <- recording for phone book number 2
+      /mp3/0003.mp3   <- recording for phone book number 3
+      /mp3/0004.mp3   <- recording for phone book number 4
+      /mp3/0005.mp3   <- recording for phone book number 5
+      /mp3/0006.mp3   <- recording for phone book number 6
+      /mp3/0007.mp3   <- the "wrong number" message
 
     This layout matters. The plain play(n) command plays the n-th file
     in the order files were WRITTEN to the card, which is not the same
@@ -105,17 +108,34 @@ const int MT8870_D2 = 25;
 const int MT8870_D3 = 26;
 const int MT8870_STD = 27;
 
-// The number guests need to dial. Digits only.
-const String TARGET_NUMBER = "8675309";
+// The numbers guests can dial, each with its own recording. Digits
+// only. Track is the /mp3/000N.mp3 file number.
+//
+// TODO: replace the placeholder numbers with the real ones.
+//
+// A number is played the instant it is fully dialed, so no number may
+// be the start of a longer one (e.g. "555" and "5551234") - the longer
+// one would be unreachable.
+struct PhoneBookEntry {
+  const char *number;
+  int track;
+};
+
+const PhoneBookEntry PHONE_BOOK[] = {
+  {"5558433", 1}, // TIDE - correct
+  {"5552628", 2}, // BOAT
+  {"5553474", 3}, // FISH
+  {"5552291", 4}, // HOTEL
+  {"5550147", 5}, // RADIO REPAIR
+  {"5550308", 6}, // NEWSPAPER
+};
+const int PHONE_BOOK_COUNT = sizeof(PHONE_BOOK) / sizeof(PHONE_BOOK[0]);
+
+const int WRONG_NUMBER_TRACK = 7;
 
 // How long to wait with no new digit before treating dialing as
 // finished and checking the attempt.
 const unsigned long DIAL_TIMEOUT_MS = 3000;
-
-// Track numbers - these are the /mp3/000N.mp3 file numbers.
-const int CORRECT_TRACK = 1;
-const int WRONG_TRACKS[] = {2, 3, 4};
-const int WRONG_TRACK_COUNT = 3;
 
 const int DFPLAYER_VOLUME = 18;  // 0-30. Start modest, earpiece is close to the ear.
 
@@ -324,8 +344,6 @@ void setup() {
   pinMode(MT8870_D2, INPUT_PULLDOWN);
   pinMode(MT8870_D3, INPUT_PULLDOWN);
   pinMode(MT8870_STD, INPUT_PULLDOWN);
-
-  randomSeed(esp_random());  // for picking a random wrong-number clip
 
 #if SIM_MODE
   Serial.println("SIM_MODE on - type the dialed number into this Serial Monitor.");
@@ -697,11 +715,30 @@ void handleDigit(char digit) {
   Serial.print("Number so far: ");
   Serial.println(dialedDigits);
 
-  // Once a full-length number has been entered, check it right away
-  // instead of waiting out the dial timeout.
-  if (dialedDigits.length() >= TARGET_NUMBER.length()) {
+  // Check right away, instead of waiting out the dial timeout, once the
+  // digits match a phone book entry or are as long as the longest one.
+  if (findPhoneBookTrack(dialedDigits) > 0 ||
+      dialedDigits.length() >= longestPhoneBookNumber()) {
     finishDialing();
   }
+}
+
+// Returns the track for a dialed number, or -1 if it is not in the book.
+int findPhoneBookTrack(const String &digits) {
+  for (int i = 0; i < PHONE_BOOK_COUNT; i++) {
+    if (digits == PHONE_BOOK[i].number) {
+      return PHONE_BOOK[i].track;
+    }
+  }
+  return -1;
+}
+
+unsigned int longestPhoneBookNumber() {
+  unsigned int longest = 0;
+  for (int i = 0; i < PHONE_BOOK_COUNT; i++) {
+    longest = max(longest, (unsigned int)strlen(PHONE_BOOK[i].number));
+  }
+  return longest;
 }
 
 void finishDialing() {
@@ -741,14 +778,15 @@ void checkNumber() {
   Serial.print("Checking dialed number: ");
   Serial.println(dialedDigits);
 
-  if (dialedDigits == TARGET_NUMBER) {
-    Serial.println("*** CORRECT NUMBER ***");
-    playTrack(CORRECT_TRACK);
+  int track = findPhoneBookTrack(dialedDigits);
+  if (track > 0) {
+    Serial.print("*** KNOWN NUMBER - playing clip ");
+    Serial.print(track);
+    Serial.println(" ***");
+    playTrack(track);
   } else {
-    int pick = WRONG_TRACKS[random(0, WRONG_TRACK_COUNT)];
-    Serial.print("Wrong number - playing clip ");
-    Serial.println(pick);
-    playTrack(pick);
+    Serial.println("Wrong number.");
+    playTrack(WRONG_NUMBER_TRACK);
   }
 
   dialedDigits = "";

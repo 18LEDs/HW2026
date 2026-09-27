@@ -3,7 +3,7 @@
   "compiler.optimization_flags": "-Os",
   "customBuildProperties": "",
   "fqbn": "esp32:esp32:esp32",
-  "hardwareFolders": "C:\\Users\\bryan\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.11,C:\\Users\\bryan\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.11",
-  "otherLibrariesFolders": "C:\\Users\\bryan\\Documents\\Arduino\\libraries",
-  "sketchLocation": "C:\\Users\\bryan\\dev\\Halloween2026\\Phone\\phone_puzzle"
+  "hardwareFolders": "/Users/18leds/Library/Arduino15/packages/esp32/hardware/esp32/3.3.11,/Users/18leds/Library/Arduino15/packages/esp32/hardware/esp32/3.3.11",
+  "otherLibrariesFolders": "/Users/18leds/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/18leds/dev/HW2026/Phone/phone_puzzle"
 }

@@ -59,7 +59,7 @@ const int TRIGGER_PIN = 5;
 // The phrase guests must key in, in plain letters. Spaces are
 // allowed and treated as word breaks. Keep it short for a party -
 // something like "PIER" or "TIDE" rather than a full sentence.
-const String TARGET_PHRASE = "PIER";
+const String TARGET_PHRASE = "BELOW";
 
 // Base timing unit in milliseconds. A dot is ~1 unit, a dash is ~3
 // units. Real Morse operators vary a lot in speed - start around
@@ -69,9 +69,22 @@ const unsigned long UNIT_MS = 150;
 // Derived thresholds - shouldn't need to touch these directly, they
 // scale off UNIT_MS above.
 const unsigned long DOT_MAX_MS = UNIT_MS * 2;        // press shorter than this = dot
-const unsigned long LETTER_GAP_MS = UNIT_MS * 3;     // silence longer than this = end of letter
 const unsigned long WORD_GAP_MS = UNIT_MS * 7;       // silence longer than this = end of word
-const unsigned long MESSAGE_TIMEOUT_MS = UNIT_MS * 15; // silence this long = check/reset attempt
+
+// Guest-friendly timings. These are deliberately NOT scaled off
+// UNIT_MS - real operators leave ~3 units between letters, but party
+// guests are glancing between a chart and the key.
+//
+// The attempt is checked the moment it reaches TARGET_PHRASE's length,
+// so nobody waits to find out if they got it. MESSAGE_TIMEOUT_MS only
+// clears an attempt someone walked away from part-way through, which
+// is why it can afford to be long.
+const unsigned long LETTER_GAP_MS = 1200;       // silence longer than this = end of letter
+const unsigned long MESSAGE_TIMEOUT_MS = 5000; // silence this long = abandon partial attempt
+const unsigned long CLEAR_HOLD_MS = 2000;       // hold the key this long = start over
+const unsigned long SOLUTION_DISPLAY_MS = 8000; // how long the "Correct!" screen stays up
+const unsigned long TRIGGER_HOLD_MS = 3000;     // how long TRIGGER_PIN stays HIGH (within the above)
+const unsigned long FINAL_WORD_PAUSE_MS = 1000; // show the full keyed word this long before checking
 
 // Mechanical switches "bounce" - the contacts physically vibrate for
 // a few milliseconds on press/release before settling, which can
@@ -130,6 +143,7 @@ String currentSymbol = "";   // dots/dashes for the letter in progress
 String decodedMessage = "";  // letters decoded so far this attempt
 
 bool waitingForTimeout = false;
+bool clearedThisPress = false;  // current press already triggered a clear
 
 // ============================================================
 // Setup
@@ -149,8 +163,8 @@ void setup() {
   display.clearDisplay();
 #endif
 
-  showMessage("Ready.\nAwaiting\nthe key...");
-  Serial.println("Ready. Awaiting the key...");
+  showMessage("Initiate.\nAwaiting\nthe key...");
+  Serial.println("Initiate. Awaiting the key...");
 }
 
 // ============================================================
@@ -168,18 +182,30 @@ void loop() {
     waitingForTimeout = false;
   }
 
+  // --- Key held down long enough: start over ---
+  // Lets a guest who knows they fumbled a letter bail out without
+  // keying the rest of the phrase or waiting out the timeout.
+  if (keyIsDown && !clearedThisPress && (now - pressStartMs) > CLEAR_HOLD_MS) {
+    clearedThisPress = true;
+    decodedMessage = "";
+    currentSymbol = "";
+    Serial.println("Key held - attempt cleared.");
+    showMessage("Cleared.\nKey again...");
+  }
+
   // --- Key just released ---
   if (!keyDownNow && keyIsDown) {
     keyIsDown = false;
     unsigned long pressDuration = now - pressStartMs;
     releaseStartMs = now;
 
-    if (pressDuration < DOT_MAX_MS) {
-      currentSymbol += ".";
+    if (clearedThisPress) {
+      // The clearing hold is not a dash.
+      clearedThisPress = false;
     } else {
-      currentSymbol += "-";
+      currentSymbol += (pressDuration < DOT_MAX_MS) ? "." : "-";
+      showMessage(decodedMessage + "\n" + currentSymbol);
     }
-    showMessage(decodedMessage + "\n" + currentSymbol);
   }
 
   // --- Check gaps while key is up ---
@@ -188,11 +214,28 @@ void loop() {
 
     if (silence > LETTER_GAP_MS) {
       char letter = decodeMorse(currentSymbol);
-      decodedMessage += letter;
-      currentSymbol = "";
-      Serial.println("Decoded letter: " + String(letter) + "   message so far: " + decodedMessage);
-      showMessage(decodedMessage);
-      waitingForTimeout = true;
+
+      if (letter == '?') {
+        // Not a real letter - almost always a fumbled dot/dash. Throw
+        // it away and let them re-key just that letter.
+        Serial.println("Unrecognized '" + currentSymbol + "' - discarded, re-key that letter.");
+        currentSymbol = "";
+        showMessage(decodedMessage + "\n?");
+        waitingForTimeout = decodedMessage.length() > 0;
+      } else {
+        decodedMessage += letter;
+        currentSymbol = "";
+        Serial.println("Decoded letter: " + String(letter) + "   message so far: " + decodedMessage);
+        showMessage(decodedMessage);
+
+        // Full length keyed - check now rather than making them wait.
+        if (decodedMessage.length() >= TARGET_PHRASE.length()) {
+          delay(FINAL_WORD_PAUSE_MS);  // let them read what they keyed
+          checkAttempt();
+        } else {
+          waitingForTimeout = true;
+        }
+      }
     }
   }
 
@@ -236,10 +279,13 @@ void checkAttempt() {
 
   if (decodedMessage == TARGET_PHRASE) {
     Serial.println("*** CORRECT ***");
-    showMessage("Correct!\n\nUNDER");
+    showMessage("Correct!\n\nBOAT 3");
     digitalWrite(TRIGGER_PIN, HIGH);
-    delay(3000);  // hold trigger high briefly; adjust once you know what it's driving
+    delay(TRIGGER_HOLD_MS);  // adjust once you know what it's driving
     digitalWrite(TRIGGER_PIN, LOW);
+    if (SOLUTION_DISPLAY_MS > TRIGGER_HOLD_MS) {
+      delay(SOLUTION_DISPLAY_MS - TRIGGER_HOLD_MS);  // keep the solution on screen
+    }
   } else {
     Serial.println("Incorrect - resetting.");
     showMessage("Try again.");
@@ -248,7 +294,7 @@ void checkAttempt() {
 
   decodedMessage = "";
   currentSymbol = "";
-  showMessage("Ready.\nAwaiting\nthe key...");
+  showMessage("Initiate.\nAwaiting\nthe key...");
 }
 
 void showMessage(const String& msg) {
