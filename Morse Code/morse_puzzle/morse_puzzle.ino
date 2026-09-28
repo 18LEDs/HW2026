@@ -279,7 +279,7 @@ void checkAttempt() {
 
   if (decodedMessage == TARGET_PHRASE) {
     Serial.println("*** CORRECT ***");
-    showMessage("Correct!\n\nBOAT 3");
+    showMessage("Correct!\n\nBOAT 3"); //SOLUTION
     digitalWrite(TRIGGER_PIN, HIGH);
     delay(TRIGGER_HOLD_MS);  // adjust once you know what it's driving
     digitalWrite(TRIGGER_PIN, LOW);

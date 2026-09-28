@@ -137,7 +137,7 @@ const int WRONG_NUMBER_TRACK = 7;
 // finished and checking the attempt.
 const unsigned long DIAL_TIMEOUT_MS = 3000;
 
-const int DFPLAYER_VOLUME = 18;  // 0-30. Start modest, earpiece is close to the ear.
+const int DFPLAYER_VOLUME = 25;  // 0-30. Start modest, earpiece is close to the ear.
 
 // The TD5580A is noticeably slower than a genuine YX5200 and will drop
 // commands sent too close together. Space them out.
