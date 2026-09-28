@@ -5,13 +5,17 @@
   NTAG213 tag. Not the puzzle firmware itself - just a setup tool.
 
   HOW TO USE:
-    1. Set TAG_IDENTIFIER below to a short name for the relic you're
-       about to write (4 characters or fewer - see note below).
-    2. Upload this sketch, open Serial Monitor at 115200 baud.
+    1. Upload this sketch once, open Serial Monitor at 115200 baud
+       with line ending set to "Newline".
+    2. Type the relic's identifier (1-4 characters, e.g. TIDE) and
+       press Enter. It is converted to uppercase to match the puzzle.
     3. Tap the ONE tag you want to write onto the reader.
     4. Watch Serial for "Write successful." Remove the tag.
-    5. Change TAG_IDENTIFIER to the next relic's name, re-upload,
-       tap the NEXT tag. Repeat for all relics.
+    5. Type the next relic's identifier, tap the NEXT tag. Repeat.
+
+  The identifier stays set until you type a new one, so tapping another
+  tag writes the SAME identifier again - type the next name first.
+  TAG_IDENTIFIER below is only the starting value after a reset.
 
   Why 4 characters max: NTAG213 stores data in 4-byte pages, and this
   sketch writes to a single page to keep things simple (no multi-page
@@ -57,13 +61,19 @@
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 // ============================================================
-// CONFIG - change this before each tag you write
+// CONFIG
 // ============================================================
-const char TAG_IDENTIFIER[5] = "TIDE";  // 4 characters, edit per relic
+// Identifier written after a reset, until one is typed in the Serial
+// Monitor. Up to 4 characters.
+const char TAG_IDENTIFIER[5] = "TIDE";
 
 // The page most NTAG213 tags have free for user data without
 // disturbing the factory NDEF/lock structure in the first few pages.
 const byte WRITE_PAGE = 4;
+
+// The identifier currently being written. Unused bytes stay 0, which is
+// where the puzzle's reader stops, so "OAR" reads back as "OAR".
+char tagIdentifier[5];
 
 void setup() {
   Serial.begin(115200);
@@ -77,8 +87,9 @@ void setup() {
   // opposite causes, so make the log distinguish them.
   Serial.println();
   Serial.println("=== RFID Tag Writer ===");
+  setIdentifier(TAG_IDENTIFIER);
   Serial.print("Identifier to write: ");
-  Serial.println(TAG_IDENTIFIER);
+  Serial.println(tagIdentifier);
 
   Serial.println("[1/4] Starting SPI...");
   SPI.begin();
@@ -114,10 +125,13 @@ void setup() {
   mfrc522.PCD_SetAntennaGain(MFRC522::RxGain_max);
 
   Serial.println();
-  Serial.println("Ready. Tap the tag you want to write onto the reader now...");
+  Serial.println("Ready. Type an identifier (1-4 characters) and press Enter");
+  Serial.println("to change what gets written, then tap the tag to write.");
 }
 
 void loop() {
+  readIdentifierFromSerial();
+
   if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) {
     return;
   }
@@ -182,13 +196,15 @@ void loop() {
 
   // --- Write ---
   byte dataBlock[4] = {
-    (byte)TAG_IDENTIFIER[0],
-    (byte)TAG_IDENTIFIER[1],
-    (byte)TAG_IDENTIFIER[2],
-    (byte)TAG_IDENTIFIER[3]
+    (byte)tagIdentifier[0],
+    (byte)tagIdentifier[1],
+    (byte)tagIdentifier[2],
+    (byte)tagIdentifier[3]
   };
 
-  Serial.println("Writing...");
+  Serial.print("Writing \"");
+  Serial.print(tagIdentifier);
+  Serial.println("\"...");
   MFRC522::StatusCode status = mfrc522.MIFARE_Ultralight_Write(WRITE_PAGE, dataBlock, 4);
 
   if (status != MFRC522::STATUS_OK) {
@@ -225,7 +241,7 @@ void loop() {
 
   if (verified) {
     Serial.print("Write successful and VERIFIED. Identifier on tag: ");
-    Serial.println(TAG_IDENTIFIER);
+    Serial.println(tagIdentifier);
   } else {
     Serial.print("*** MISMATCH - tag now reads: ");
     printPageAsText(readBuffer);
@@ -251,6 +267,54 @@ void printPageAsText(const byte *page) {
 
 void finishTag() {
   mfrc522.PICC_HaltA();
-  Serial.println("Remove the tag. Change TAG_IDENTIFIER and re-upload for the next relic.");
+  Serial.println("Remove the tag. Type the next identifier and press Enter,");
+  Serial.print("or tap another tag to write \"");
+  Serial.print(tagIdentifier);
+  Serial.println("\" again.");
   delay(3000);
+}
+
+// Collects typed characters into a line without blocking, then uses it
+// as the new identifier when Enter (newline) arrives.
+void readIdentifierFromSerial() {
+  static String line = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      line.trim();
+      if (line.length() > 0) {
+        line.toUpperCase();
+        if (setIdentifier(line.c_str())) {
+          Serial.print("Identifier set to \"");
+          Serial.print(tagIdentifier);
+          Serial.println("\". Tap the tag to write it.");
+        }
+      }
+      line = "";
+    } else {
+      line += c;
+      if (line.length() > 16) line = "";  // runaway guard
+    }
+  }
+}
+
+// Validates and stores a new identifier. Leaves the current one alone
+// and explains why if the new one won't fit or can't be read back.
+bool setIdentifier(const char *id) {
+  size_t len = strlen(id);
+  if (len == 0 || len > 4) {
+    Serial.print("*** \"");
+    Serial.print(id);
+    Serial.println("\" is not 1-4 characters - identifier unchanged.");
+    return false;
+  }
+  for (size_t i = 0; i < len; i++) {
+    if (id[i] <= ' ' || id[i] >= 127) {
+      Serial.println("*** Use letters, digits or symbols only (no spaces) - identifier unchanged.");
+      return false;
+    }
+  }
+  memset(tagIdentifier, 0, sizeof(tagIdentifier));
+  memcpy(tagIdentifier, id, len);
+  return true;
 }

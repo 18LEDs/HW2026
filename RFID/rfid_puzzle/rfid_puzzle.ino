@@ -106,8 +106,8 @@ const byte READ_PAGE = 4;
 
 // The correct order relics must be tapped in. These must exactly
 // match the 4-character identifiers written onto each tag.
-const int SEQUENCE_LENGTH = 3;
-const String TARGET_SEQUENCE[SEQUENCE_LENGTH] = {"TIDE", "BONE", "SALT"};
+const int SEQUENCE_LENGTH = 2;
+const String TARGET_SEQUENCE[SEQUENCE_LENGTH] = {"GARG", "CARD"}; //"TIDE", "BONE", "SALT"
 
 // If too much time passes between taps, the attempt resets - stops
 // someone from wandering off mid-attempt and coming back hours later
