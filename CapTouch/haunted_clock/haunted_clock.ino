@@ -53,7 +53,14 @@
   Power note: the haunt is the hardest thing a servo can do - constant
   fast reversals, each one a current spike. If the ESP32 resets or the
   hand stutters mid-haunt, give the servo its own 5V supply and just
-  share ground with the ESP32.
+  share ground with the ESP32. The startup banner prints why the board
+  last restarted - "brownout" there means exactly this.
+
+  Heat: whenever the hand is still, the servo is relaxed (no pulses), so
+  it isn't straining to hold position. If it still runs hot, check the
+  ends of travel: type a0 and a180 - if the servo buzzes or hums there,
+  it is pushing against its internal stop. Pull MIN_ANGLE / MAX_ANGLE in
+  until it goes quiet.
 */
 
 #include <WiFi.h>
@@ -91,6 +98,18 @@ const unsigned long HAUNT_SPIN_MS = 3000;
 // and how long that return move takes.
 const unsigned long RETURN_DELAY_MS = 10000;
 const unsigned long RETURN_MOVE_MS = 1500;
+
+// Top speed of the hand, in degrees per second, for every move. Lower
+// is gentler on a USB power bank (a servo draws the most current while
+// it accelerates) and a slower, heavier haunt reads as creepier. An
+// unloaded SG90 manages about 600; the haunt was near that before.
+// Moves that would go faster are stretched out to stay under this.
+const float MAX_SPEED_DEG_PER_S = 500;
+
+// Relax the servo (stop sending pulses) whenever the hand is still, so
+// it doesn't sit there straining and heating up. The gears hold a light
+// hand in place. Set false if the hand droops under its own weight.
+const bool RELAX_WHEN_STILL = true;
 
 // A new position is sent every servo frame (50Hz = 20ms).
 const unsigned long SERVO_FRAME_MS = 20;
@@ -209,6 +228,8 @@ void setup() {
 
   Serial.println();
   Serial.println("=== Haunted Clock ===");
+  Serial.print("Last restart: ");
+  Serial.println(resetReasonText(esp_reset_reason()));
 
   espNowReady = startEspNow();
   if (espNowReady) {
@@ -222,6 +243,8 @@ void setup() {
   Serial.printf("Rest angle %d, final angle %d.\n", REST_ANGLE, finalAngle);
   Serial.println();
   printHelp();
+
+  relaxServo();  // the WiFi startup above gave it time to reach rest
 }
 
 void loop() {
@@ -236,6 +259,7 @@ void loop() {
     returnPending = false;
     Serial.printf("Returning to rest (%d degrees).\n", REST_ANGLE);
     moveTo(REST_ANGLE, RETURN_MOVE_MS);
+    relaxServo();
   }
 }
 
@@ -253,10 +277,19 @@ int clampAngle(float angle) {
 
 // Moves the hand to an angle over durationMs, easing in and out so
 // each swing starts and stops like something with weight. Blocks
-// until the move is finished.
+// until the move is finished. Takes longer than durationMs if needed
+// to stay under MAX_SPEED_DEG_PER_S.
 void moveTo(int target, unsigned long durationMs) {
   target = clampAngle(target);
   float from = currentAngle;
+
+  // The ease-in-out curve peaks at pi/2 times its average speed, in the
+  // middle of the move - that peak is what has to stay under the limit.
+  float distance = fabsf(target - from);
+  unsigned long minMs = (unsigned long)(1000.0f * (PI / 2) * distance / MAX_SPEED_DEG_PER_S);
+  if (durationMs < minMs) {
+    durationMs = minMs;
+  }
   unsigned long start = millis();
   unsigned long elapsed;
 
@@ -268,6 +301,17 @@ void moveTo(int target, unsigned long durationMs) {
   }
   handServo.writeMicroseconds(angleToUs(target));
   currentAngle = target;
+}
+
+// Stops the pulses so the servo goes limp at its current position.
+// The next moveTo() starts the pulses again at the right width, so the
+// hand doesn't jump. (detach() would, which is why it isn't used.)
+void relaxServo() {
+  if (!RELAX_WHEN_STILL) {
+    return;
+  }
+  delay(250);  // let the hand physically catch up with the last write
+  handServo.release();
 }
 
 // The haunt: a burst of wild swings, then a wind-down that overshoots
@@ -306,6 +350,7 @@ void haunt() {
 
   Serial.printf("  Hand stopped at %d degrees. Returning to rest in %lu s.\n", finalAngle,
                 RETURN_DELAY_MS / 1000);
+  relaxServo();
   returnPending = true;
   settledAtMs = millis();
 }
@@ -350,6 +395,7 @@ void handleCommand(String cmd) {
     returnPending = false;
     Serial.printf("[CMD] Moving to %d degrees (auto-return cancelled).\n", angle);
     moveTo(angle, 600);
+    relaxServo();
   } else if (c == 'f') {
     int angle;
     if (!parseAngle(arg, angle)) {
@@ -362,6 +408,7 @@ void handleCommand(String cmd) {
     returnPending = false;
     Serial.printf("[CMD] Returning to rest (%d degrees).\n", REST_ANGLE);
     moveTo(REST_ANGLE, RETURN_MOVE_MS);
+    relaxServo();
   } else if (c == 'i' && arg.length() == 0) {
     printInfo();
   } else if ((c == 'h' || c == '?') && arg.length() == 0) {
@@ -416,4 +463,18 @@ void printHelp() {
   Serial.println("  r      return to rest angle now");
   Serial.println("  i      MAC address, channel, messages received");
   Serial.println("  h      this help");
+}
+
+const char *resetReasonText(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_EXT:      return "reset button";
+    case ESP_RST_SW:       return "software restart (e.g. after upload)";
+    case ESP_RST_PANIC:    return "*** CRASH (panic) ***";
+    case ESP_RST_INT_WDT:
+    case ESP_RST_TASK_WDT:
+    case ESP_RST_WDT:      return "*** WATCHDOG - something hung ***";
+    case ESP_RST_BROWNOUT: return "*** BROWNOUT - power dipped, likely the servo ***";
+    default:               return "other";
+  }
 }
