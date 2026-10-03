@@ -4,7 +4,9 @@
   Second half of the capacitive touch puzzle. When touch_puzzle.ino is
   solved it sends a "solved" message over ESP-NOW. This board swings
   the clock hand around wildly for a few seconds, then lets it wind
-  down and settle on FINAL_ANGLE, where the answer is painted.
+  down and settle on FINAL_ANGLE, where the answer is painted. After
+  RETURN_DELAY_MS it quietly returns to REST_ANGLE, ready for the next
+  group.
 
   Library needed (install via Tools > Manage Libraries):
     - ESP32Servo  (Kevin Harrington / madhephaestus)
@@ -39,7 +41,7 @@
            for finding where the answer sits on the face
     f135   set the final angle used by the haunt (until reset - copy
            the value you like into FINAL_ANGLE and reflash)
-    r      return the hand to REST_ANGLE
+    r      return the hand to REST_ANGLE now
     i      info: MAC address, channel, messages received
     h      help
 
@@ -79,11 +81,16 @@ const int REST_ANGLE = 90;
 
 // Where the hand settles after the haunt - pointing at the answer.
 // Placeholder for now; find the real one with the "a" command.
-const int FINAL_ANGLE = 135;
+const int FINAL_ANGLE = 43;
 
 // How long the wild-swinging part lasts. The wind-down onto
 // FINAL_ANGLE adds about another 2 seconds after this.
 const unsigned long HAUNT_SPIN_MS = 3000;
+
+// How long the hand stays on the answer before returning to REST_ANGLE,
+// and how long that return move takes.
+const unsigned long RETURN_DELAY_MS = 10000;
+const unsigned long RETURN_MOVE_MS = 1500;
 
 // A new position is sent every servo frame (50Hz = 20ms).
 const unsigned long SERVO_FRAME_MS = 20;
@@ -115,6 +122,12 @@ float currentAngle = REST_ANGLE;
 int finalAngle = FINAL_ANGLE;
 
 bool espNowReady = false;
+
+// Set when the haunt finishes; loop() returns the hand to rest once
+// RETURN_DELAY_MS has passed. Checked in loop() rather than waited out
+// with delay(), so serial commands and messages still work meanwhile.
+bool returnPending = false;
+unsigned long settledAtMs = 0;
 
 // Messages arrive on the WiFi task, not the loop() task, and the haunt
 // takes several seconds. So the receive callback only queues the
@@ -218,6 +231,12 @@ void loop() {
   while (xQueueReceive(incomingQueue, &in, 0) == pdTRUE) {
     handleMessage(in);
   }
+
+  if (returnPending && millis() - settledAtMs >= RETURN_DELAY_MS) {
+    returnPending = false;
+    Serial.printf("Returning to rest (%d degrees).\n", REST_ANGLE);
+    moveTo(REST_ANGLE, RETURN_MOVE_MS);
+  }
 }
 
 // ============================================================
@@ -285,7 +304,10 @@ void haunt() {
     moveTo(finalAngle + overshoot[i], 220 + i * 50);
   }
 
-  Serial.printf("  Hand stopped at %d degrees.\n", finalAngle);
+  Serial.printf("  Hand stopped at %d degrees. Returning to rest in %lu s.\n", finalAngle,
+                RETURN_DELAY_MS / 1000);
+  returnPending = true;
+  settledAtMs = millis();
 }
 
 // ============================================================
@@ -325,7 +347,8 @@ void handleCommand(String cmd) {
     if (!parseAngle(arg, angle)) {
       return;
     }
-    Serial.printf("[CMD] Moving to %d degrees.\n", angle);
+    returnPending = false;
+    Serial.printf("[CMD] Moving to %d degrees (auto-return cancelled).\n", angle);
     moveTo(angle, 600);
   } else if (c == 'f') {
     int angle;
@@ -336,8 +359,9 @@ void handleCommand(String cmd) {
     Serial.printf("[CMD] Final angle set to %d (until reset - put it in FINAL_ANGLE to keep it).\n",
                   finalAngle);
   } else if (c == 'r' && arg.length() == 0) {
+    returnPending = false;
     Serial.printf("[CMD] Returning to rest (%d degrees).\n", REST_ANGLE);
-    moveTo(REST_ANGLE, 800);
+    moveTo(REST_ANGLE, RETURN_MOVE_MS);
   } else if (c == 'i' && arg.length() == 0) {
     printInfo();
   } else if ((c == 'h' || c == '?') && arg.length() == 0) {
@@ -377,6 +401,11 @@ void printInfo() {
   Serial.println();
   Serial.printf("  Hand:      %d degrees (rest %d, final %d)\n", clampAngle(currentAngle),
                 REST_ANGLE, finalAngle);
+  if (returnPending) {
+    unsigned long elapsed = millis() - settledAtMs;
+    unsigned long remaining = elapsed < RETURN_DELAY_MS ? RETURN_DELAY_MS - elapsed : 0;
+    Serial.printf("  Returning to rest in %lu s\n", remaining / 1000);
+  }
 }
 
 void printHelp() {
@@ -384,7 +413,7 @@ void printHelp() {
   Serial.println("  t      run the full haunt (same as a real solve)");
   Serial.printf("  a90    move the hand to an angle (%d-%d)\n", MIN_ANGLE, MAX_ANGLE);
   Serial.println("  f135   set the final angle for the haunt (until reset)");
-  Serial.println("  r      return to rest angle");
+  Serial.println("  r      return to rest angle now");
   Serial.println("  i      MAC address, channel, messages received");
   Serial.println("  h      this help");
 }
