@@ -2,7 +2,8 @@
   Children of the Pier - Capacitive Touch Sequence Puzzle - ESP32 Firmware
   ----------------------------------------------------------------------
   A set of touch pads, some of which must be touched in the correct
-  order. Touch the right pads in the right order and TRIGGER_PIN fires.
+  order. Touch the right pads in the right order and a "solved" message
+  is sent over ESP-NOW to the haunted clock (haunted_clock.ino).
 
   Out of the box: 6 pads, and a 3-touch secret sequence.
 
@@ -53,24 +54,39 @@
   why the raw numbers look the way they do.
 
   ----------------------------------------------------------------------
+  LINK TO THE HAUNTED CLOCK (ESP-NOW)
+  ----------------------------------------------------------------------
+  ESP-NOW sends short messages straight to the clock's ESP32 - no
+  router or WiFi network. CLOCK_MAC must be the MAC the clock prints at
+  startup, and ESPNOW_CHANNEL and the message format must match
+  haunted_clock.ino exactly.
+
+  The clock acknowledges every message, so this sketch knows whether
+  it arrived. A message that isn't acknowledged is retried a few times,
+  then reported as failed. The clock ignores retried copies of a solve
+  it has already acted on.
+
+  ----------------------------------------------------------------------
   WIRING
   ----------------------------------------------------------------------
     Each pad -> its GPIO in PADS[] (one wire, no resistor, no ground)
-    TRIGGER_PIN (GPIO 25) -> whatever the solve should drive (relay
-                             module, LED, the next prop's input)
     Keep pad wires short and apart from each other.
 
   ----------------------------------------------------------------------
   SERIAL MONITOR (115200 baud, line ending: Newline)
   ----------------------------------------------------------------------
     0-9  simulate touching that pad number - test the logic and the
-         trigger without touching anything
+         clock link without touching anything
+    p    ping the clock - tests the link without solving
     v    toggle a live view of every pad's reading and drop
     b    re-measure baselines (hands off the pads!)
     h    show help
 */
 
 #include "esp_arduino_version.h"
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 
 // ============================================================
 // CONFIG
@@ -91,25 +107,32 @@ struct Pad {
 // Safe touch pins on the classic ESP32: 4, 13, 14, 27, 32, 33.
 const Pad PADS[] = {
   //  pin   name       touch threshold (% drop)
-  {    4,   "Pad 0",   41.0 },
-  {   13,   "Pad 1",   41.0 },
-  {   14,   "Pad 2",   41.0 },
-  {   27,   "Pad 3",   41.0 },
-  {   32,   "Pad 4",   41.0 },
-  {   33,   "Pad 5",   41.0 },
+  {    4,   "Pad 0",   10.0 },
+  {   13,   "Pad 1",   10.0 },
+  {   14,   "Pad 2",   10.0 },
+  {   27,   "Pad 3",   10.0 },
+  {   32,   "Pad 4",   10.0 },
+  {   33,   "Pad 5",   10.0 },
 };
 const int PAD_COUNT = sizeof(PADS) / sizeof(PADS[0]);
 
 // The secret order, as pad numbers from PADS[] above.
-const int SEQUENCE[] = {3, 0, 5};
+const int SEQUENCE[] = {4, 5, 2, 0};
 const int SEQUENCE_LENGTH = sizeof(SEQUENCE) / sizeof(SEQUENCE[0]);
 
 // Longest allowed pause between touches before the attempt resets.
 const unsigned long MAX_GAP_MS = 10000;
 
-const int TRIGGER_PIN = 25;
-const bool TRIGGER_ACTIVE_HIGH = true;  // false for active-low relay modules
-const unsigned long TRIGGER_HOLD_MS = 3000;
+// The haunted clock's MAC address, as printed by haunted_clock.ino.
+const uint8_t CLOCK_MAC[6] = {0x20, 0x50, 0x0D, 0x4E, 0x05, 0x94};
+
+// Must match ESPNOW_CHANNEL in haunted_clock.ino.
+const uint8_t ESPNOW_CHANNEL = 1;
+
+// Each message is tried this many times in total before giving up,
+// waiting SEND_RETRY_MS between tries.
+const int SEND_ATTEMPTS = 5;
+const unsigned long SEND_RETRY_MS = 300;
 
 // A reading must stay past the threshold this long to count as a touch -
 // filters out a single noisy sample or a sleeve brushing past.
@@ -131,6 +154,20 @@ const float BASELINE_TRACKING_ALPHA = 0.001;
 
 const unsigned long SETTLE_MS = 4000;
 const int BASELINE_SAMPLES = 20;
+
+// ============================================================
+// Message format - must be IDENTICAL in haunted_clock.ino
+// ============================================================
+
+const uint32_t PIER_MAGIC = 0x52454950;  // "PIER" - ignore anything else
+const uint8_t MSG_SOLVED = 1;            // touch puzzle solved: run the haunt
+const uint8_t MSG_PING = 2;              // link test: just log it
+
+struct __attribute__((packed)) PierMessage {
+  uint32_t magic;
+  uint8_t type;
+  uint32_t eventId;  // random per event, so a resent copy isn't acted on twice
+};
 
 // ============================================================
 // State
@@ -155,8 +192,26 @@ int progress = 0;                // how many steps of SEQUENCE are matched
 unsigned long lastTouchMs = 0;
 
 bool configValid = false;
-bool triggerActive = false;
-unsigned long triggerStartedMs = 0;
+
+bool espNowReady = false;
+
+// The message currently being sent to the clock. Sending is
+// asynchronous: esp_now_send() returns straight away and the result
+// (acknowledged or not) arrives later in onEspNowSent(), on the WiFi
+// task. serviceOutbox() in loop() handles retries from there.
+struct Outbox {
+  bool active;
+  bool awaitingResult;
+  PierMessage msg;
+  int attempts;
+  unsigned long nextAttemptMs;
+  unsigned long sentAtMs;
+};
+Outbox outbox = {};
+
+// Written by the WiFi task, read by loop(): 0 = no result yet,
+// 1 = acknowledged, 2 = not acknowledged.
+volatile uint8_t sendResult = 0;
 
 unsigned long lastSampleMs = 0;
 bool liveView = false;
@@ -170,13 +225,19 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  pinMode(TRIGGER_PIN, OUTPUT);
-  setTrigger(false);
-
   Serial.println();
   Serial.println("=== Capacitive Touch Sequence Puzzle ===");
   Serial.print("Arduino-ESP32 core ");
   Serial.println(ESP_ARDUINO_VERSION_STR);
+
+  espNowReady = startEspNow();
+  if (espNowReady) {
+    Serial.printf("ESP-NOW ready on channel %u. Clock: ", ESPNOW_CHANNEL);
+    printMac(CLOCK_MAC);
+    Serial.println();
+  } else {
+    Serial.println("*** ESP-NOW failed to start - the clock will NOT be told about a solve. ***");
+  }
 
   configValid = validateConfig();
   if (!configValid) {
@@ -209,18 +270,13 @@ void setup() {
 
 void loop() {
   handleSerial();
+  serviceOutbox();
 
   if (!configValid) {
     return;
   }
 
   unsigned long now = millis();
-
-  if (triggerActive && now - triggerStartedMs >= TRIGGER_HOLD_MS) {
-    triggerActive = false;
-    setTrigger(false);
-    Serial.println("Trigger released.");
-  }
 
   if (progress > 0 && now - lastTouchMs > MAX_GAP_MS) {
     resetProgress("too long between touches");
@@ -389,10 +445,8 @@ int longestMatchedPrefix() {
 
 void solved() {
   Serial.println();
-  Serial.println("*** SEQUENCE CORRECT - TRIGGERING ***");
-  setTrigger(true);
-  triggerActive = true;
-  triggerStartedMs = millis();
+  Serial.println("*** SEQUENCE CORRECT - TELLING THE CLOCK ***");
+  sendToClock(MSG_SOLVED);
   historyLength = 0;
   progress = 0;
 }
@@ -405,8 +459,100 @@ void resetProgress(const char *reason) {
   progress = 0;
 }
 
-void setTrigger(bool on) {
-  digitalWrite(TRIGGER_PIN, (on == TRIGGER_ACTIVE_HIGH) ? HIGH : LOW);
+// ============================================================
+// ESP-NOW link to the haunted clock
+// ============================================================
+
+void onEspNowSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  sendResult = (status == ESP_NOW_SEND_SUCCESS) ? 1 : 2;
+}
+
+bool startEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    return false;
+  }
+  esp_now_register_send_cb(onEspNowSent);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, CLOCK_MAC, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;
+  return esp_now_add_peer(&peer) == ESP_OK;
+}
+
+// Queues a message for the clock. A new message replaces one still
+// being retried - the latest event is the one that matters.
+void sendToClock(uint8_t type) {
+  if (!espNowReady) {
+    Serial.println("  [ESP-NOW] Not running - message not sent.");
+    return;
+  }
+  outbox.active = true;
+  outbox.awaitingResult = false;
+  outbox.msg.magic = PIER_MAGIC;
+  outbox.msg.type = type;
+  outbox.msg.eventId = esp_random();
+  outbox.attempts = 0;
+  outbox.nextAttemptMs = millis();
+}
+
+void serviceOutbox() {
+  if (!outbox.active) {
+    return;
+  }
+  unsigned long now = millis();
+  const char *what = outbox.msg.type == MSG_SOLVED ? "Solve" : "Ping";
+
+  if (outbox.awaitingResult) {
+    uint8_t result = sendResult;
+    // The result normally arrives within a few ms. No result at all
+    // after a second is treated as a failure.
+    if (result == 0 && now - outbox.sentAtMs < 1000) {
+      return;
+    }
+    outbox.awaitingResult = false;
+
+    if (result == 1) {
+      Serial.printf("  [ESP-NOW] %s delivered to the clock.\n", what);
+      outbox.active = false;
+      return;
+    }
+    if (outbox.attempts >= SEND_ATTEMPTS) {
+      Serial.printf("  [ESP-NOW] *** %s NOT delivered after %d tries. Is the clock\n", what,
+                    SEND_ATTEMPTS);
+      Serial.println("             powered, in range, and on the same channel? ***");
+      outbox.active = false;
+      return;
+    }
+    Serial.printf("  [ESP-NOW] Clock didn't answer (try %d/%d) - retrying.\n", outbox.attempts,
+                  SEND_ATTEMPTS);
+    outbox.nextAttemptMs = now + SEND_RETRY_MS;
+    return;
+  }
+
+  if ((long)(now - outbox.nextAttemptMs) < 0) {
+    return;
+  }
+  sendResult = 0;
+  outbox.attempts++;
+  outbox.sentAtMs = now;
+  outbox.awaitingResult = true;
+  esp_err_t err = esp_now_send(CLOCK_MAC, (const uint8_t *)&outbox.msg, sizeof(PierMessage));
+  if (err != ESP_OK) {
+    // Never left this board, so no callback will come - count it as
+    // a failed try straight away.
+    Serial.printf("  [ESP-NOW] Send error: %s\n", esp_err_to_name(err));
+    sendResult = 2;
+  }
+}
+
+void printMac(const uint8_t *mac) {
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 // ============================================================
@@ -421,10 +567,6 @@ bool validateConfig() {
 
     if (digitalPinToTouchChannel(pin) < 0) {
       Serial.printf("  ERROR: %s uses GPIO %u, which is not a touch pin.\n", PADS[i].name, pin);
-      ok = false;
-    }
-    if (pin == TRIGGER_PIN) {
-      Serial.printf("  ERROR: %s uses GPIO %u, which is also TRIGGER_PIN.\n", PADS[i].name, pin);
       ok = false;
     }
     if (pin == 0 || pin == 2 || pin == 12 || pin == 15) {
@@ -483,6 +625,13 @@ void handleCommand(String cmd) {
 
   if (cmd == "h" || cmd == "?") {
     printHelp();
+    return;
+  }
+
+  // Works even with a broken pad config - the link is separate.
+  if (cmd == "p") {
+    Serial.println("[CMD] Pinging the clock...");
+    sendToClock(MSG_PING);
     return;
   }
 
@@ -591,5 +740,6 @@ void printHelp() {
   Serial.println("  v    toggle live readings (* = touched)");
   Serial.println("  m    biggest drop seen per pad + suggested thresholds");
   Serial.println("  b    re-measure baselines - hands off!");
+  Serial.println("  p    ping the clock (tests the ESP-NOW link)");
   Serial.println("  h    this help");
 }
